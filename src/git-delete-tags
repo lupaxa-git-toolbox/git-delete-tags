@@ -1,0 +1,603 @@
+#!/usr/bin/env bash
+#
+# git-delete-tags
+#
+# Delete local and/or remote Git tags with optional protection.
+#
+# Default behaviour (no mode flags):
+#   - Resolve requested tags (names and/or all)
+#   - Drop protected tags
+#   - Delete matching tags on the remote (one push --delete per tag)
+#   - Delete matching tags locally (one git tag -d per tag)
+#
+# WARNING: This is destructive when not in dry-run.
+#
+VERSION="0.0.0"
+
+REMOTE_NAME="origin"
+YES="false"
+DRY_RUN="false"
+LOCAL_ONLY="false"
+REMOTE_ONLY="false"
+SUMMARY_ONLY="false"
+SEEN_ALL="false"
+
+PROTECTED_TAGS=()
+REQUESTED_TAGS=()
+
+# Resolved plan
+TAGS_LOCAL=()
+TAGS_REMOTE=()
+TAGS_PROTECTED_SKIPPED=()
+TAGS_UNAVAILABLE_SKIPPED=()
+
+REMOTE_DELETED_COUNT=0
+LOCAL_DELETED_COUNT=0
+OUTCOME="none"   # none|success|dry-run|failed
+
+COLOR_RED=""
+COLOR_GREEN=""
+COLOR_YELLOW=""
+COLOR_CYAN=""
+COLOR_BOLD=""
+COLOR_RESET=""
+
+STEP_CURRENT=0
+STEP_TOTAL=0
+STEP_LABEL=""
+
+init_colors()
+{
+    if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]
+    then
+        COLOR_RED=$'\033[31m'
+        COLOR_GREEN=$'\033[32m'
+        COLOR_YELLOW=$'\033[33m'
+        COLOR_CYAN=$'\033[36m'
+        COLOR_BOLD=$'\033[1m'
+        COLOR_RESET=$'\033[0m'
+    fi
+}
+
+usage()
+{
+    cat <<EOF
+${COLOR_BOLD}Usage:${COLOR_RESET} $0 [tag ...] | all [options]
+
+Delete local and/or remote Git tags with dry-run, summary, and protection.
+
+Options:
+  -r, --remote NAME      Remote to operate on (default: ${REMOTE_NAME})
+      --local-only       Delete only local tags (no remote operations)
+      --remote-only      Delete only remote tags (keep local tags)
+  -T, --protect-tag TAG  Protect a specific tag from deletion (repeatable)
+  -y, --yes              Assume 'DELETE' confirmation (non-interactive)
+  -n, --dry-run          Show what would happen without running commands
+  -S, --summary          Show a detailed plan based on all options and exit
+  -V, --version          Print version and exit
+  -h, --help             Show this help and exit
+
+Examples:
+  $0 v1.0.0
+  $0 v1.0.0 v1.1.0
+  $0 all
+  $0 all --yes
+  $0 all -T v1.0.0 -T latest
+  $0 all --dry-run
+  $0 all --summary
+EOF
+}
+
+error()
+{
+    echo "${COLOR_RED}ERROR:${COLOR_RESET} $*" >&2
+    exit 1
+}
+
+begin_step()
+{
+    STEP_CURRENT=$((STEP_CURRENT + 1))
+    STEP_LABEL="[${STEP_CURRENT}/${STEP_TOTAL}]"
+}
+
+count_planned_steps()
+{
+    STEP_TOTAL=0
+    if [ "${#TAGS_REMOTE[@]}" -gt 0 ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${#TAGS_LOCAL[@]}" -gt 0 ]
+    then
+        STEP_TOTAL=$((STEP_TOTAL + 1))
+    fi
+    if [ "${STEP_TOTAL}" -eq 0 ]
+    then
+        STEP_TOTAL=1
+    fi
+}
+
+parse_args()
+{
+    if [ "$#" -eq 0 ]
+    then
+        usage
+        exit 1
+    fi
+
+    while [ "$#" -gt 0 ]
+    do
+        case "$1" in
+            -r|--remote)
+                [ -n "${2:-}" ] || error "${1} requires an argument."
+                REMOTE_NAME="$2"
+                shift 2
+                ;;
+            --local-only)
+                LOCAL_ONLY="true"
+                shift
+                ;;
+            --remote-only)
+                REMOTE_ONLY="true"
+                shift
+                ;;
+            -T|--protect-tag)
+                [ -n "${2:-}" ] || error "${1} requires an argument."
+                PROTECTED_TAGS+=( "$2" )
+                shift 2
+                ;;
+            -y|--yes)
+                YES="true"
+                shift
+                ;;
+            -n|--dry-run)
+                DRY_RUN="true"
+                shift
+                ;;
+            -S|--summary)
+                SUMMARY_ONLY="true"
+                shift
+                ;;
+            -V|--version)
+                echo "git-delete-tags ${VERSION}"
+                exit 0
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            all)
+                SEEN_ALL="true"
+                shift
+                ;;
+            -*)
+                echo "${COLOR_RED}ERROR:${COLOR_RESET} Unknown option: $1" >&2
+                usage
+                exit 1
+                ;;
+            *)
+                REQUESTED_TAGS+=( "$1" )
+                shift
+                ;;
+        esac
+    done
+
+    if [ "${LOCAL_ONLY}" = "true" ] && [ "${REMOTE_ONLY}" = "true" ]
+    then
+        error "Cannot use --local-only and --remote-only together."
+    fi
+}
+
+list_remote_tags()
+{
+    local remote_refs
+
+    # Prints remote tag names (no ^{} peeled refs), one per line.
+    if ! remote_refs=$(git ls-remote --tags "${REMOTE_NAME}")
+    then
+        return 1
+    fi
+
+    printf '%s\n' "${remote_refs}" \
+        | awk '{print $2}' \
+        | sed -e 's#^refs/tags/##' -e '/\^{}$/d' \
+        | sort -u
+}
+
+is_protected()
+{
+    local tag="$1" pt
+    for pt in "${PROTECTED_TAGS[@]}"
+    do
+        if [ "${tag}" = "${pt}" ]
+        then
+            return 0
+        fi
+    done
+    return 1
+}
+
+array_contains()
+{
+    local needle="$1"
+    shift
+    local x
+    for x in "$@"
+    do
+        if [ "${x}" = "${needle}" ]
+        then
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_tags()
+{
+    local candidates=()
+    local deduped=()
+    local local_set=()
+    local remote_set=()
+    local t
+    local has_local
+    local has_remote
+    local remote_tags
+
+    mapfile -t local_set < <(git tag -l)
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        if ! remote_tags=$(list_remote_tags)
+        then
+            error "Failed to list tags from remote '${REMOTE_NAME}'."
+        fi
+        if [ -n "${remote_tags}" ]
+        then
+            mapfile -t remote_set <<< "${remote_tags}"
+        fi
+    fi
+
+    if [ "${SEEN_ALL}" = "true" ]
+    then
+        candidates=( "${local_set[@]}" )
+        if [ "${LOCAL_ONLY}" = "false" ]
+        then
+            for t in "${remote_set[@]}"
+            do
+                if ! array_contains "${t}" "${candidates[@]}"
+                then
+                    candidates+=( "${t}" )
+                fi
+            done
+        fi
+    else
+        candidates=( "${REQUESTED_TAGS[@]}" )
+    fi
+
+    for t in "${candidates[@]}"
+    do
+        array_contains "${t}" "${deduped[@]}" || deduped+=( "${t}" )
+    done
+    candidates=( "${deduped[@]}" )
+
+    for t in "${candidates[@]}"
+    do
+        if is_protected "${t}"
+        then
+            TAGS_PROTECTED_SKIPPED+=( "${t}" )
+            continue
+        fi
+
+        has_local="false"
+        has_remote="false"
+        if array_contains "${t}" "${local_set[@]}"
+        then
+            has_local="true"
+        fi
+        if [ "${LOCAL_ONLY}" = "false" ] && array_contains "${t}" "${remote_set[@]}"
+        then
+            has_remote="true"
+        fi
+
+        if [ "${LOCAL_ONLY}" = "true" ]
+        then
+            if [ "${has_local}" = "true" ]
+            then
+                TAGS_LOCAL+=( "${t}" )
+            elif [ "${SEEN_ALL}" = "true" ]
+            then
+                TAGS_UNAVAILABLE_SKIPPED+=( "${t}" )
+            else
+                error "Tag '${t}' does not exist locally."
+            fi
+        elif [ "${REMOTE_ONLY}" = "true" ]
+        then
+            if [ "${has_remote}" = "true" ]
+            then
+                TAGS_REMOTE+=( "${t}" )
+            elif [ "${SEEN_ALL}" = "true" ]
+            then
+                TAGS_UNAVAILABLE_SKIPPED+=( "${t}" )
+            else
+                error "Tag '${t}' does not exist remotely."
+            fi
+        elif [ "${has_local}" = "false" ] && [ "${has_remote}" = "false" ]
+        then
+            if [ "${SEEN_ALL}" = "true" ]
+            then
+                TAGS_UNAVAILABLE_SKIPPED+=( "${t}" )
+            else
+                error "Tag '${t}' does not exist locally or remotely."
+            fi
+        else
+            if [ "${has_local}" = "true" ]
+            then
+                TAGS_LOCAL+=( "${t}" )
+            fi
+            if [ "${has_remote}" = "true" ]
+            then
+                TAGS_REMOTE+=( "${t}" )
+            fi
+        fi
+    done
+
+    if [ "${#TAGS_LOCAL[@]}" -eq 0 ] && [ "${#TAGS_REMOTE[@]}" -eq 0 ]
+    then
+        if [ "${#TAGS_PROTECTED_SKIPPED[@]}" -gt 0 ]
+        then
+            echo "${COLOR_YELLOW}Nothing to delete; all matching tags are protected.${COLOR_RESET}"
+        else
+            echo "${COLOR_YELLOW}Nothing to delete.${COLOR_RESET}"
+        fi
+        exit 0
+    fi
+}
+
+print_action_plan()
+{
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo "${COLOR_BOLD}=== ACTION SUMMARY (no commands will be executed) ===${COLOR_RESET}"
+    else
+        echo "${COLOR_BOLD}=== ACTION PLAN ===${COLOR_RESET}"
+    fi
+    echo
+
+    if [ "${LOCAL_ONLY}" = "true" ]
+    then
+        echo "Remote:             ${COLOR_YELLOW}(local-only mode: no remote operations)${COLOR_RESET}"
+    elif [ "${REMOTE_ONLY}" = "true" ]
+    then
+        echo "Remote:             ${COLOR_CYAN}${REMOTE_NAME}${COLOR_RESET} (remote-only)"
+    else
+        echo "Remote:             ${COLOR_CYAN}${REMOTE_NAME}${COLOR_RESET}"
+    fi
+
+    echo "Dry-run:            ${DRY_RUN}"
+    echo "Summary-only:       ${SUMMARY_ONLY}"
+    echo "Mode:               $(
+        if [ "${LOCAL_ONLY}" = "true" ]; then echo "local-only"
+        elif [ "${REMOTE_ONLY}" = "true" ]; then echo "remote-only"
+        else echo "local+remote"
+        fi
+    )"
+    echo
+
+    if [ "${#PROTECTED_TAGS[@]}" -gt 0 ]
+    then
+        echo "Protected tags:     ${PROTECTED_TAGS[*]}"
+    else
+        echo "Protected tags:     (none)"
+    fi
+    if [ "${#TAGS_PROTECTED_SKIPPED[@]}" -gt 0 ]
+    then
+        echo "Protected skipped:  ${TAGS_PROTECTED_SKIPPED[*]}"
+    fi
+    if [ "${#TAGS_UNAVAILABLE_SKIPPED[@]}" -gt 0 ]
+    then
+        echo "Unavailable skipped:${TAGS_UNAVAILABLE_SKIPPED[*]}"
+    fi
+    echo
+
+    echo "Tags to delete remotely:"
+    if [ "${#TAGS_REMOTE[@]}" -eq 0 ]
+    then
+        echo "  (none)"
+    else
+        printf '  %s\n' "${TAGS_REMOTE[@]}"
+    fi
+    echo
+    echo "Tags to delete locally:"
+    if [ "${#TAGS_LOCAL[@]}" -eq 0 ]
+    then
+        echo "  (none)"
+    else
+        printf '  %s\n' "${TAGS_LOCAL[@]}"
+    fi
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}No commands have been executed because --summary was used.${COLOR_RESET}"
+    fi
+}
+
+confirm()
+{
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        echo
+        echo "${COLOR_BOLD}${COLOR_YELLOW}DRY-RUN:${COLOR_RESET} No changes will be made. Commands will be simulated."
+        echo
+        return
+    fi
+
+    echo
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo " ${COLOR_RED}DANGER:${COLOR_RESET} This will IRREVERSIBLY delete Git tags."
+    echo "${COLOR_BOLD}${COLOR_RED}************************************************************************${COLOR_RESET}"
+    echo
+
+    if [ "${YES}" = "true" ]
+    then
+        echo "${COLOR_YELLOW}--yes supplied, proceeding without interactive confirmation.${COLOR_RESET}"
+        return
+    fi
+
+    read -r -p "Type 'DELETE' to continue, or anything else to abort: " answer
+    if [ "${answer}" != "DELETE" ]
+    then
+        echo "Aborted."
+        exit 1
+    fi
+}
+
+delete_remote_tags()
+{
+    local t failed=""
+    echo
+    echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL} Deleting remote tags on '${REMOTE_NAME}'...${COLOR_RESET}"
+
+    for t in "${TAGS_REMOTE[@]}"
+    do
+        echo "    git push ${REMOTE_NAME} --delete ${t}"
+        if [ "${DRY_RUN}" = "true" ]
+        then
+            echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+            REMOTE_DELETED_COUNT=$((REMOTE_DELETED_COUNT + 1))
+            continue
+        fi
+        if git push "${REMOTE_NAME}" --delete "${t}"
+        then
+            REMOTE_DELETED_COUNT=$((REMOTE_DELETED_COUNT + 1))
+        else
+            failed="${t}"
+            break
+        fi
+    done
+
+    if [ -n "${failed}" ]
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} Remote delete failed for '${failed}'." >&2
+        echo "       Remote deleted so far: ${REMOTE_DELETED_COUNT}" >&2
+        echo "       Local deletes not started." >&2
+        return 1
+    fi
+    return 0
+}
+
+delete_local_tags()
+{
+    local t failed=""
+    echo
+    echo "${COLOR_CYAN}==>${COLOR_RESET} ${COLOR_BOLD}${STEP_LABEL} Deleting local tags...${COLOR_RESET}"
+
+    for t in "${TAGS_LOCAL[@]}"
+    do
+        echo "    git tag -d ${t}"
+        if [ "${DRY_RUN}" = "true" ]
+        then
+            echo "    ${COLOR_YELLOW}(dry-run: command not executed)${COLOR_RESET}"
+            LOCAL_DELETED_COUNT=$((LOCAL_DELETED_COUNT + 1))
+            continue
+        fi
+        if git tag -d "${t}"
+        then
+            LOCAL_DELETED_COUNT=$((LOCAL_DELETED_COUNT + 1))
+        else
+            failed="${t}"
+            break
+        fi
+    done
+
+    if [ -n "${failed}" ]
+    then
+        echo "${COLOR_RED}ERROR:${COLOR_RESET} Local delete failed for '${failed}'." >&2
+        echo "       Local deleted so far: ${LOCAL_DELETED_COUNT}" >&2
+        echo "       Remote deleted earlier: ${REMOTE_DELETED_COUNT}" >&2
+        return 1
+    fi
+    return 0
+}
+
+print_final_summary()
+{
+    echo
+    echo "${COLOR_BOLD}=== RESULT ===${COLOR_RESET}"
+    echo "  Remote deleted:     ${REMOTE_DELETED_COUNT}"
+    echo "  Local deleted:      ${LOCAL_DELETED_COUNT}"
+    echo "  Protected skipped:  ${#TAGS_PROTECTED_SKIPPED[@]}"
+    if [ "${SEEN_ALL}" = "true" ]
+    then
+        echo "  Unavailable skipped:${#TAGS_UNAVAILABLE_SKIPPED[@]}"
+    fi
+    case "${OUTCOME}" in
+        dry-run)
+            echo "  Outcome:            ${COLOR_YELLOW}dry-run complete (no changes)${COLOR_RESET}"
+            ;;
+        failed)
+            echo "  Outcome:            ${COLOR_RED}partial failure${COLOR_RESET}"
+            ;;
+        success)
+            echo "  Outcome:            ${COLOR_GREEN}success${COLOR_RESET}"
+            ;;
+        *)
+            echo "  Outcome:            ${OUTCOME}"
+            ;;
+    esac
+}
+
+main()
+{
+    init_colors
+    parse_args "$@"
+
+    if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1
+    then
+        error "This does not appear to be a Git repository."
+    fi
+
+    if [ "${LOCAL_ONLY}" = "false" ]
+    then
+        if ! git remote get-url "${REMOTE_NAME}" >/dev/null 2>&1
+        then
+            error "Remote '${REMOTE_NAME}' does not exist."
+        fi
+    fi
+
+    resolve_tags
+
+    if [ "${SUMMARY_ONLY}" = "true" ]
+    then
+        print_action_plan
+        exit 0
+    fi
+
+    print_action_plan
+    confirm
+    count_planned_steps
+    STEP_CURRENT=0
+
+    if [ "${LOCAL_ONLY}" = "false" ] && [ "${#TAGS_REMOTE[@]}" -gt 0 ]
+    then
+        begin_step
+        delete_remote_tags || { OUTCOME="failed"; print_final_summary; exit 1; }
+        STEP_LABEL=""
+    fi
+
+    if [ "${REMOTE_ONLY}" = "false" ] && [ "${#TAGS_LOCAL[@]}" -gt 0 ]
+    then
+        begin_step
+        delete_local_tags || { OUTCOME="failed"; print_final_summary; exit 1; }
+        STEP_LABEL=""
+    fi
+
+    if [ "${DRY_RUN}" = "true" ]
+    then
+        OUTCOME="dry-run"
+    else
+        OUTCOME="success"
+    fi
+    print_final_summary
+}
+
+main "$@"
