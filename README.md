@@ -8,13 +8,13 @@
 
 Delete local and remote Git tags with dry-run, summary, and protection.
 
-## What it does
+## What it Does
 
 `git-delete-tags` removes one or more tags from a repository — locally, on a remote, or both. You can name specific tags, pass `all` to target every tag, and protect selected names from deletion.
 
 Use it when cleaning up stale release tags, resetting tag namespaces before a fresh release cycle, or removing tags that should never have been pushed.
 
-## Quick start
+## Quick Start
 
 ```bash
 ./src/git-delete-tags all --summary      # plan only — no changes
@@ -25,7 +25,7 @@ Use it when cleaning up stale release tags, resetting tag namespaces before a fr
 
 **This is destructive.** Prefer `--summary` or `-n` first.
 
-## Default behaviour
+## Default Behaviour
 
 With no mode flags, the script will:
 
@@ -36,7 +36,7 @@ With no mode flags, the script will:
 
 Remote tag names are discovered via `git ls-remote --tags`.
 
-## Common options
+## Common Options
 
 | Flag                     | Purpose                                              |
 | :----------------------- | :--------------------------------------------------- |
@@ -79,7 +79,7 @@ Remove tags from the remote only:
 ./src/git-delete-tags all --remote-only --yes
 ```
 
-## Safety notes
+## Safety Notes
 
 - `--dry-run` prints the action plan and simulates commands without asking for `DELETE`.
 - Real runs require typing `DELETE` unless you pass `-y` / `--yes`.
