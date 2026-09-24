@@ -4,7 +4,7 @@
     </a>
 </p>
 
-<h1 align="center">git-delete-tags</h1>
+<h1 align="center">Git Delete Tags</h1>
 
 Delete local and remote Git tags with dry-run, summary, and protection.
 
