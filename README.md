@@ -14,6 +14,18 @@ Delete local and remote Git tags with dry-run, summary, and protection.
 
 Use it when cleaning up stale release tags, resetting tag namespaces before a fresh release cycle, or removing tags that should never have been pushed.
 
+## Install
+
+With Homebrew:
+
+```bash
+brew tap the-lupaxa-project/tap
+brew trust the-lupaxa-project/tap
+brew install git-delete-tags
+```
+
+Or run the script from a clone: `./src/git-delete-tags --help`.
+
 ## Quick Start
 
 ```bash
