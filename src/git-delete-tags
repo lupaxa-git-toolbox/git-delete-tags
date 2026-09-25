@@ -12,7 +12,7 @@
 #
 # WARNING: This is destructive when not in dry-run.
 #
-VERSION="0.1.4"
+VERSION="0.1.5"
 
 REMOTE_NAME="origin"
 YES="false"
